@@ -1,5 +1,5 @@
 /**
- * @license r.js 2.1.22+ Tue, 15 Mar 2016 18:35:16 GMT Copyright jQuery Foundation and other contributors.
+ * @license r.js 2.1.22+ Tue, 15 Mar 2016 22:32:22 GMT Copyright jQuery Foundation and other contributors.
  * Released under MIT license, http://github.com/requirejs/r.js/LICENSE
  */
 
@@ -19,7 +19,7 @@ var requirejs, require, define, xpcUtil;
 (function (console, args, readFileFunc) {
     var fileName, env, fs, vm, path, exec, rhinoContext, dir, nodeRequire,
         nodeDefine, exists, reqMain, loadedOptimizedLib, existsForNode, Cc, Ci,
-        version = '2.1.22+ Tue, 15 Mar 2016 18:35:16 GMT',
+        version = '2.1.22+ Tue, 15 Mar 2016 22:32:22 GMT',
         jsSuffixRegExp = /\.js$/,
         commandOption = '',
         useLibLoaded = {},
@@ -13683,7 +13683,7 @@ var AST_SimpleStatement = DEFNODE("SimpleStatement", "body", {
 }, AST_Statement);
 
 function walk_body(node, visitor) {
-    if (node.body instanceof AST_Statement) {
+    if (node.body instanceof AST_Node) {
         node.body._walk(visitor);
     }
     else node.body.forEach(function(stat){
@@ -13803,6 +13803,10 @@ var AST_ForIn = DEFNODE("ForIn", "init name object", {
     }
 }, AST_IterationStatement);
 
+var AST_ForOf = DEFNODE("ForOf", null, {
+    $documentation: "A `for ... of` statement",
+}, AST_ForIn);
+
 var AST_With = DEFNODE("With", "expression", {
     $documentation: "A `with` statement",
     $propdoc: {
@@ -13899,12 +13903,97 @@ var AST_Toplevel = DEFNODE("Toplevel", "globals", {
     }
 }, AST_Scope);
 
+var AST_Expansion = DEFNODE("Expansion", "symbol", {
+    $documentation: "An expandible argument, such as ...rest, a splat, such as [1,2,...all], or an expansion in a variable declaration, such as var [first, ...rest] = list",
+    $propdoc: {
+        symbol: "AST_Symbol the thing to be expanded"
+    },
+    _walk: function(visitor) {
+        var self = this;
+        return visitor._visit(this, function(){
+            self.symbol.walk(visitor);
+        });
+    }
+});
+
+var AST_ArrowParametersOrSeq = DEFNODE("ArrowParametersOrSeq", "expressions", {
+    $documentation: "A set of arrow function parameters or a sequence expression. This is used because when the parser sees a \"(\" it could be the start of a seq, or the start of a parameter list of an arrow function.",
+    $propdoc: {
+        expressions: "[AST_Expression|AST_Destructuring|AST_Expansion*] array of expressions or argument names or destructurings."
+    },
+    as_params: function (croak) {
+        // We don't want anything which doesn't belong in a destructuring
+        var root = this;
+        return this.expressions.map(function to_fun_args(ex, _, __, default_seen_above) {
+            if (ex instanceof AST_Object) {
+                if (ex.properties.length == 0)
+                    croak("Invalid destructuring function parameter", ex.start.line, ex.start.col);
+                return new AST_Destructuring({
+                    start: ex.start,
+                    end: ex.end,
+                    is_array: false,
+                    default: default_seen_above,
+                    names: ex.properties.map(to_fun_args)
+                });
+            } else if (ex instanceof AST_ObjectKeyVal && ex.shorthand) {
+                return new AST_SymbolFunarg({
+                    name: ex.key,
+                    start: ex.start,
+                    end: ex.end
+                });
+            } else if (ex instanceof AST_Destructuring) {
+                if (ex.names.length == 0)
+                    croak("Invalid destructuring function parameter", ex.start.line, ex.start.col);
+                ex.names = ex.names.map(to_fun_args);
+                return ex;
+            } else if (ex instanceof AST_SymbolRef) {
+                return new AST_SymbolFunarg({
+                    name: ex.name,
+                    default: default_seen_above,
+                    start: ex.start,
+                    end: ex.end
+                });
+            } else if (ex instanceof AST_Expansion) {
+                return ex;
+            } else if (ex instanceof AST_Array) {
+                if (ex.elements.length === 0)
+                    croak("Invalid destructuring function parameter", ex.start.line, ex.start.col);
+                return new AST_Destructuring({
+                    start: ex.start,
+                    end: ex.end,
+                    is_array: true,
+                    default: default_seen_above,
+                    names: ex.elements.map(to_fun_args)
+                });
+            } else if (ex instanceof AST_Assign) {
+                return to_fun_args(ex.left, undefined, undefined, ex.right);
+            } else {
+                croak("Invalid function parameter", ex.start.line, ex.start.col);
+            }
+        });
+    },
+    as_expr: function (croak) {
+        return AST_Seq.from_array(this.expressions);
+    }
+});
+
 var AST_Lambda = DEFNODE("Lambda", "name argnames uses_arguments", {
     $documentation: "Base class for functions",
     $propdoc: {
         name: "[AST_SymbolDeclaration?] the name of this function",
-        argnames: "[AST_SymbolFunarg*] array of function arguments",
+        argnames: "[AST_SymbolFunarg|AST_Destructuring|AST_Expansion*] array of function arguments, destructurings, or expanding arguments",
         uses_arguments: "[boolean/S] tells whether this function accesses the arguments array"
+    },
+    args_as_names: function () {
+        var out = [];
+        for (var i = 0; i < this.argnames.length; i++) {
+            if (this.argnames[i] instanceof AST_Destructuring) {
+                out = out.concat(this.argnames[i].all_symbols());
+            } else {
+                out.push(this.argnames[i]);
+            }
+        }
+        return out;
     },
     _walk: function(visitor) {
         return visitor._visit(this, function(){
@@ -13925,9 +14014,72 @@ var AST_Function = DEFNODE("Function", null, {
     $documentation: "A function expression"
 }, AST_Lambda);
 
+var AST_Arrow = DEFNODE("Arrow", null, {
+    $documentation: "An ES6 Arrow function ((a) => b)"
+}, AST_Lambda);
+
+var AST_ConciseMethod = DEFNODE("ConciseMethod", "static", {
+    $propdoc: {
+        static: "[boolean] whether this method is static (classes only)",
+    },
+    $documentation: "An ES6 concise method inside an object or class"
+}, AST_Lambda);
+
 var AST_Defun = DEFNODE("Defun", null, {
     $documentation: "A function definition"
 }, AST_Lambda);
+
+/* -----[ DESTRUCTURING ]----- */
+var AST_Destructuring = DEFNODE("Destructuring", "names is_array default", {
+    $documentation: "A destructuring of several names. Used in destructuring assignment and with destructuring function argument names",
+    _walk: function(visitor) {
+        return visitor._visit(this, function(){
+            this.names.forEach(function(name){
+                name._walk(visitor);
+            });
+        });
+    },
+    all_symbols: function() {
+        var out = [];
+        this.walk(new TreeWalker(function (node) {
+            if (node instanceof AST_Symbol) {
+                out.push(node);
+            }
+            if (node instanceof AST_Expansion) {
+                out.push(node.symbol);
+            }
+        }));
+        return out;
+    }
+});
+
+var AST_PrefixedTemplateString = DEFNODE("PrefixedTemplateString", "template_string prefix", {
+    $documentation: "A templatestring with a prefix, such as String.raw`foobarbaz`",
+    $propdoc: {
+        template_string: "[AST_TemplateString] The template string",
+        prefix: "[AST_SymbolRef|AST_PropAccess] The prefix, which can be a symbol such as `foo` or a dotted expression such as `String.raw`."
+    },
+    _walk: function(visitor) {
+        this.prefix._walk(visitor);
+        this.template_string._walk(visitor);
+    }
+})
+
+var AST_TemplateString = DEFNODE("TemplateString", "segments", {
+    $documentation: "A template string literal",
+    $propdoc: {
+        segments: "[string|AST_Expression]* One or more segments. They can be the parts that are evaluated, or the raw string parts."
+    },
+    _walk: function(visitor) {
+        return visitor._visit(this, function(){
+            this.segments.forEach(function(seg, i){
+                if (i % 2 !== 0) {
+                    seg._walk(visitor);
+                }
+            });
+        });
+    }
+});
 
 /* -----[ JUMPS ]----- */
 
@@ -14082,15 +14234,77 @@ var AST_Var = DEFNODE("Var", null, {
     $documentation: "A `var` statement"
 }, AST_Definitions);
 
+var AST_Let = DEFNODE("Let", null, {
+    $documentation: "A `let` statement"
+}, AST_Definitions);
+
 var AST_Const = DEFNODE("Const", null, {
     $documentation: "A `const` statement"
 }, AST_Definitions);
 
+var AST_NameImport = DEFNODE("NameImport", "foreign_name name", {
+    $documentation: "The part of the import statement that imports names from a module.",
+    $propdoc: {
+        foreign_name: "[AST_SymbolImportForeign] The name being imported (as specified in the module)",
+        name: "[AST_SymbolImport] The name as it becomes available to this module."
+    },
+    _walk: function (visitor) {
+        return visitor._visit(this, function() {
+            this.foreign_name._walk(visitor);
+            this.name._walk(visitor);
+        });
+    }
+})
+
+var AST_Import = DEFNODE("Import", "imported_name imported_names module_name", {
+    $documentation: "An `import` statement",
+    $propdoc: {
+        imported_name: "[AST_SymbolImport] The name of the variable holding the module's default export.",
+        imported_names: "[AST_NameImport*] The names of non-default imported variables",
+        module_name: "[AST_String] String literal describing where this module came from",
+    },
+    _walk: function(visitor) {
+        return visitor._visit(this, function() {
+            if (this.imported_name) {
+                this.imported_name._walk(visitor);
+            }
+            if (this.imported_names) {
+                this.imported_names.forEach(function (name_import) {
+                    name_import._walk(visitor);
+                });
+            }
+            this.module_name._walk(visitor);
+        });
+    }
+});
+
+var AST_Export = DEFNODE("Export", "exported_definition exported_value is_default", {
+    $documentation: "An `export` statement",
+    $propdoc: {
+        exported_definition: "[AST_Defun|AST_Definitions|AST_DefClass?] An exported definition",
+        exported_value: "[AST_Node?] An exported value",
+        is_default: "[Boolean] Whether this is the default exported value of this module"
+    },
+    _walk: function (visitor) {
+        visitor._visit(this, function () {
+            if (this.exported_definition) {
+                this.exported_definition._walk(visitor);
+            }
+            if (this.exported_value) {
+                this.exported_value._walk(visitor);
+            }
+        });
+    }
+}, AST_Statement);
+
 var AST_VarDef = DEFNODE("VarDef", "name value", {
     $documentation: "A variable declaration; only appears in a AST_Definitions node",
     $propdoc: {
-        name: "[AST_SymbolVar|AST_SymbolConst] name of the variable",
+        name: "[AST_SymbolVar|AST_SymbolConst|AST_Destructuring] name of the variable",
         value: "[AST_Node?] initializer, or null of there's no initializer"
+    },
+    is_destructuring: function() {
+        return this.name instanceof AST_Destructuring;
     },
     _walk: function(visitor) {
         return visitor._visit(this, function(){
@@ -14307,20 +14521,67 @@ var AST_ObjectProperty = DEFNODE("ObjectProperty", "key value", {
     }
 });
 
-var AST_ObjectKeyVal = DEFNODE("ObjectKeyVal", "quote", {
+var AST_ObjectKeyVal = DEFNODE("ObjectKeyVal", "quote shorthand", {
     $documentation: "A key: value object property",
     $propdoc: {
-        quote: "[string] the original quote character"
+        quote: "[string] the original quote character",
+        shorthand: "[boolean] whether this is a shorthand key:value pair, expressed as just the key."
     }
 }, AST_ObjectProperty);
 
-var AST_ObjectSetter = DEFNODE("ObjectSetter", null, {
+var AST_ObjectComputedKeyVal = DEFNODE("ObjectComputedKeyVal", null, {
+    $documentation: "An object property whose key is computed. Like `[Symbol.iterator]: function...` or `[routes.homepage]: renderHomepage`",
+    _walk: function(visitor) {
+        return visitor._visit(this, function(){
+            this.key._walk(visitor);
+            this.value._walk(visitor);
+        });
+    }
+}, AST_ObjectProperty);
+
+var AST_ObjectSetter = DEFNODE("ObjectSetter", "static", {
+    $propdoc: {
+        static: "[boolean] whether this is a static setter (classes only)"
+    },
     $documentation: "An object setter property",
 }, AST_ObjectProperty);
 
-var AST_ObjectGetter = DEFNODE("ObjectGetter", null, {
+var AST_ObjectGetter = DEFNODE("ObjectGetter", "static", {
+    $propdoc: {
+        static: "[boolean] whether this is a static getter (classes only)"
+    },
     $documentation: "An object getter property",
 }, AST_ObjectProperty);
+
+var AST_Class = DEFNODE("Class", "name extends properties", {
+    $propdoc: {
+        name: "[AST_SymbolClass|AST_SymbolDefClass?] optional class name.",
+        extends: "[AST_Node]? optional parent class",
+        properties: "[AST_ObjectProperty*] array of properties"
+    },
+    $documentation: "An ES6 class",
+    _walk: function(visitor) {
+        return visitor._visit(this, function(){
+            if (this.name) {
+                this.name._walk(visitor);
+            }
+            if (this.extends) {
+                this.extends._walk(visitor);
+            }
+            this.properties.forEach(function(prop){
+                prop._walk(visitor);
+            });
+        });
+    },
+}, AST_Scope);
+
+var AST_DefClass = DEFNODE("DefClass", null, {
+    $documentation: "A class definition",
+}, AST_Class);
+
+var AST_ClassExpression = DEFNODE("ClassExpression", null, {
+    $documentation: "A class expression."
+}, AST_Class);
 
 var AST_Symbol = DEFNODE("Symbol", "scope name thedef", {
     $propdoc: {
@@ -14331,14 +14592,24 @@ var AST_Symbol = DEFNODE("Symbol", "scope name thedef", {
     $documentation: "Base class for all symbols",
 });
 
+var AST_NewTarget = DEFNODE("NewTarget", null, {
+    $documentation: "A reference to new.target"
+});
+
 var AST_SymbolAccessor = DEFNODE("SymbolAccessor", null, {
     $documentation: "The name of a property accessor (setter/getter function)"
 }, AST_Symbol);
 
-var AST_SymbolDeclaration = DEFNODE("SymbolDeclaration", "init", {
+var AST_SymbolDeclaration = DEFNODE("SymbolDeclaration", "init default", {
     $documentation: "A declaration symbol (symbol in var/const, function name or argument, symbol in catch)",
     $propdoc: {
-        init: "[AST_Node*/S] array of initializers for this declaration."
+        init: "[AST_Node*/S] array of initializers for this declaration.",
+        default: "[AST_Expression] The default for this parameter. For example, `= 6`"
+    },
+    _walk: function (visitor) {
+        return visitor._visit(this, function() {
+            if (this.default) this.default._walk(visitor);
+        });
     }
 }, AST_Symbol);
 
@@ -14358,13 +14629,33 @@ var AST_SymbolDefun = DEFNODE("SymbolDefun", null, {
     $documentation: "Symbol defining a function",
 }, AST_SymbolDeclaration);
 
+var AST_SymbolMethod = DEFNODE("SymbolMethod", null, {
+    $documentation: "Symbol in an object defining a method",
+}, AST_Symbol);
+
 var AST_SymbolLambda = DEFNODE("SymbolLambda", null, {
     $documentation: "Symbol naming a function expression",
+}, AST_SymbolDeclaration);
+
+var AST_SymbolDefClass = DEFNODE("SymbolDefClass", null, {
+    $documentation: "Symbol naming a class's name in a class declaration. Lexically scoped to its containing scope, and accessible within the class."
+}, AST_SymbolDeclaration);
+
+var AST_SymbolClass = DEFNODE("SymbolClass", null, {
+    $documentation: "Symbol naming a class's name. Lexically scoped to the class."
 }, AST_SymbolDeclaration);
 
 var AST_SymbolCatch = DEFNODE("SymbolCatch", null, {
     $documentation: "Symbol naming the exception in catch",
 }, AST_SymbolDeclaration);
+
+var AST_SymbolImport = DEFNODE("SymbolImport", null, {
+    $documentation: "Symbol refering to an imported name",
+}, AST_SymbolDeclaration);
+
+var AST_SymbolImportForeign = DEFNODE("SymbolImportForeign", null, {
+    $documentation: "A symbol imported from a module, but it is defined in the other module, and its real name is irrelevant for this module's purposes",
+}, AST_Symbol);
 
 var AST_Label = DEFNODE("Label", "references", {
     $documentation: "Symbol naming a label (declaration)",
@@ -14387,6 +14678,10 @@ var AST_LabelRef = DEFNODE("LabelRef", null, {
 
 var AST_This = DEFNODE("This", null, {
     $documentation: "The `this` symbol",
+}, AST_Symbol);
+
+var AST_Super = DEFNODE("Super", null, {
+    $documentation: "The `super` symbol",
 }, AST_Symbol);
 
 var AST_Constant = DEFNODE("Constant", null, {
@@ -14512,7 +14807,7 @@ TreeWalker.prototype = {
         var dir = this.directives[type];
         if (dir) return dir;
         var node = this.stack[this.stack.length - 1];
-        if (node instanceof AST_Scope) {
+        if (node instanceof AST_Scope && node.body) {
             for (var i = 0; i < node.body.length; ++i) {
                 var st = node.body[i];
                 if (!(st instanceof AST_Directive)) break;
@@ -14599,9 +14894,9 @@ TreeWalker.prototype = {
 
 "use strict";
 
-var KEYWORDS = 'break case catch const continue debugger default delete do else finally for function if in instanceof new return switch throw try typeof var void while with';
+var KEYWORDS = 'break case catch class const continue debugger default delete do else extends finally for function if in instanceof new return switch throw try typeof var let void while with import export';
 var KEYWORDS_ATOM = 'false null true';
-var RESERVED_WORDS = 'abstract boolean byte char class double enum export extends final float goto implements import int interface long native package private protected public short static super synchronized this throws transient volatile yield'
+var RESERVED_WORDS = 'abstract boolean byte char double enum export final float goto implements int interface long native package private protected public short static super synchronized this throws transient volatile yield'
     + " " + KEYWORDS_ATOM + " " + KEYWORDS;
 var KEYWORDS_BEFORE_EXPRESSION = 'return new delete throw else case';
 
@@ -14614,6 +14909,9 @@ var OPERATOR_CHARS = makePredicate(characters("+-*&%=<>!?|~^"));
 
 var RE_HEX_NUMBER = /^0x[0-9a-f]+$/i;
 var RE_OCT_NUMBER = /^0[0-7]+$/;
+var RE_ES6_OCT_NUMBER = /^0o[0-7]+$/i;
+var RE_BIN_NUMBER = /^0b[01]+$/i;
+var RE_DEC_NUMBER = /^\d*\.?\d*(?:e[+-]?\d*(?:\d\.?|\.?\d)\d*)?$/i;
 
 var OPERATORS = makePredicate([
     "in",
@@ -14666,7 +14964,7 @@ var WHITESPACE_CHARS = makePredicate(characters(" \u00a0\n\r\t\f\u000b\u200b\u18
 
 var PUNC_BEFORE_EXPRESSION = makePredicate(characters("[{(,.;:"));
 
-var PUNC_CHARS = makePredicate(characters("[]{}(),;:"));
+var PUNC_CHARS = makePredicate(characters("[]{}(),;:`"));
 
 var REGEXP_MODIFIERS = makePredicate(characters("gmsiy"));
 
@@ -14736,6 +15034,12 @@ function parse_js_number(num) {
         return parseInt(num.substr(2), 16);
     } else if (RE_OCT_NUMBER.test(num)) {
         return parseInt(num.substr(1), 8);
+    } else if (RE_ES6_OCT_NUMBER.test(num)) {
+        return parseInt(num.substr(2), 8);
+    } else if (RE_BIN_NUMBER.test(num)) {
+        return parseInt(num.substr(2), 2);
+    } else if (RE_DEC_NUMBER.test(num)) {
+        return parseFloat(num);
     } else {
         var val = parseFloat(num);
         if (val == num) return val;
@@ -14954,6 +15258,7 @@ function tokenizer($TEXT, filename, html5_comments, shebang) {
                 if (octal_len > 0) ch = String.fromCharCode(parseInt(ch, 8));
                 else ch = read_escaped_char(true);
             }
+            else if (ch == "\n") parse_error("Unterminated string constant");
             else if (ch == quote) break;
             ret += ch;
         }
@@ -15072,11 +15377,28 @@ function tokenizer($TEXT, filename, html5_comments, shebang) {
         return S.regex_allowed ? read_regexp("") : read_operator("/");
     };
 
+    function handle_eq_sign() {
+        next();
+        if (peek() === ">") {
+            next();
+            return token("arrow", "=>");
+        } else {
+            return read_operator("=");
+        }
+    };
+
     function handle_dot() {
         next();
-        return is_digit(peek().charCodeAt(0))
-            ? read_num(".")
-            : token("punc", ".");
+        if (is_digit(peek().charCodeAt(0))) {
+            return read_num(".");
+        }
+        if (peek() === ".") {
+            next();  // Consume second dot
+            next();  // Consume third dot
+            return token("expand", "...");
+        }
+
+        return token("punc", ".");
     };
 
     function read_word() {
@@ -15121,6 +15443,7 @@ function tokenizer($TEXT, filename, html5_comments, shebang) {
           case 34: case 39: return read_string(ch);
           case 46: return handle_dot();
           case 47: return handle_slash();
+          case 61: return handle_eq_sign();
         }
         if (is_digit(code)) return read_num();
         if (PUNC_CHARS(ch)) return token("punc", next());
@@ -15135,6 +15458,9 @@ function tokenizer($TEXT, filename, html5_comments, shebang) {
         }
         parse_error("Unexpected character '" + ch + "'");
     };
+
+    next_token.next = next;
+    next_token.peek = peek;
 
     next_token.context = function(nc) {
         if (nc) S = nc;
@@ -15279,9 +15605,9 @@ function parse($TEXT, options) {
         );
     };
 
-    function semicolon() {
+    function semicolon(optional) {
         if (is("punc", ";")) next();
-        else if (!can_insert_semicolon()) unexpected();
+        else if (!optional && !can_insert_semicolon()) unexpected();
     };
 
     function parenthesised() {
@@ -15294,7 +15620,7 @@ function parse($TEXT, options) {
     function embed_tokens(parser) {
         return function() {
             var start = S.token;
-            var expr = parser();
+            var expr = parser.apply(null, arguments);
             var end = prev();
             expr.start = start;
             expr.end = end;
@@ -15346,6 +15672,7 @@ function parse($TEXT, options) {
                 });
               case "[":
               case "(":
+              case "`":
                 return simple_statement();
               case ";":
                 next();
@@ -15369,7 +15696,7 @@ function parse($TEXT, options) {
               case "do":
                 return new AST_Do({
                     body      : in_loop(statement),
-                    condition : (expect_token("keyword", "while"), tmp = parenthesised(), semicolon(), tmp)
+                    condition : (expect_token("keyword", "while"), tmp = parenthesised(), semicolon(true), tmp)
                 });
 
               case "while":
@@ -15380,6 +15707,9 @@ function parse($TEXT, options) {
 
               case "for":
                 return for_();
+
+              case "class":
+                return class_(AST_DefClass);
 
               case "function":
                 return function_(AST_Defun);
@@ -15417,6 +15747,9 @@ function parse($TEXT, options) {
               case "var":
                 return tmp = var_(), semicolon(), tmp;
 
+              case "let":
+                return tmp = let_(), semicolon(), tmp;
+
               case "const":
                 return tmp = const_(), semicolon(), tmp;
 
@@ -15425,6 +15758,12 @@ function parse($TEXT, options) {
                     expression : parenthesised(),
                     body       : statement()
                 });
+
+              case "import":
+                return tmp = import_(), semicolon(), tmp;
+
+              case "export":
+                return tmp = export_(), semicolon(), tmp;
 
               default:
                 unexpected();
@@ -15487,14 +15826,22 @@ function parse($TEXT, options) {
         expect("(");
         var init = null;
         if (!is("punc", ";")) {
-            init = is("keyword", "var")
-                ? (next(), var_(true))
-                : expression(true, true);
-            if (is("operator", "in")) {
-                if (init instanceof AST_Var && init.definitions.length > 1)
+            init =
+                is("keyword", "var") ? (next(), var_(true)) :
+                is("keyword", "let") ? (next(), let_(true)) :
+                                       expression(true, true);
+            var is_in = is("operator", "in");
+            var is_of = is("name", "of");
+            if (is_in || is_of) {
+                if ((init instanceof AST_Var || init instanceof AST_Let) &&
+                        init.definitions.length > 1)
                     croak("Only one variable declaration allowed in for..in loop");
                 next();
-                return for_in(init);
+                if (is_in) {
+                    return for_in(init);
+                } else {
+                    return for_of(init);
+                }
             }
         }
         return regular_for(init);
@@ -15514,6 +15861,18 @@ function parse($TEXT, options) {
         });
     };
 
+    function for_of(init) {
+        var lhs = init instanceof AST_Var ? init.definitions[0].name : null;
+        var obj = expression(true);
+        expect(")");
+        return new AST_ForOf({
+            init   : init,
+            name   : lhs,
+            object : obj,
+            body   : in_loop(statement)
+        });
+    };
+
     function for_in(init) {
         var lhs = init instanceof AST_Var ? init.definitions[0].name : null;
         var obj = expression(true);
@@ -15526,35 +15885,91 @@ function parse($TEXT, options) {
         });
     };
 
+    var arrow_function = function(args) {
+        expect_token("arrow", "=>");
+
+        var argnames;
+        if (typeof args.length === 'number') {
+            argnames = args;
+        } else {
+            argnames = args.as_params(croak);
+        }
+
+        var body = is("punc", "{") ?
+            _function_body(true) :
+            _function_body(false);
+
+        return new AST_Arrow({
+            start    : args.start,
+            end      : body.end,
+            argnames : argnames,
+            body     : body
+        });
+    };
+
     var function_ = function(ctor) {
+        var start = S.token
+
         var in_statement = ctor === AST_Defun;
         var name = is("name") ? as_symbol(in_statement ? AST_SymbolDefun : AST_SymbolLambda) : null;
         if (in_statement && !name)
             unexpected();
-        expect("(");
+
+        var args = params_or_seq_().as_params(croak);
+        var body = _function_body(true);
         return new ctor({
-            name: name,
-            argnames: (function(first, a){
-                while (!is("punc", ")")) {
-                    if (first) first = false; else expect(",");
-                    a.push(as_symbol(AST_SymbolFunarg));
-                }
-                next();
-                return a;
-            })(true, []),
-            body: (function(loop, labels){
-                ++S.in_function;
-                S.in_directives = true;
-                S.in_loop = 0;
-                S.labels = [];
-                var a = block_();
-                --S.in_function;
-                S.in_loop = loop;
-                S.labels = labels;
-                return a;
-            })(S.in_loop, S.labels)
+            start : args.start,
+            end   : body.end,
+            name  : name,
+            argnames: args,
+            body  : body
         });
     };
+
+    function params_or_seq_() {
+        var start = S.token
+        expect("(");
+        var first = true;
+        var a = [];
+        while (!is("punc", ")")) {
+            if (first) first = false; else expect(",");
+            if (is("expand", "...")) {
+                next();
+                a.push(new AST_Expansion({
+                    start: prev(),
+                    symbol: as_symbol(AST_SymbolFunarg),
+                    end: S.token,
+                }));
+            } else {
+                a.push(expression(false));
+            }
+        }
+        var end = S.token
+        next();
+        return new AST_ArrowParametersOrSeq({
+            start: start,
+            end: end,
+            expressions: a
+        });
+    }
+
+    function _function_body(block) {
+        var loop = S.in_loop;
+        var labels = S.labels;
+        ++S.in_function;
+        if (block)
+            S.in_directives = true;
+        S.in_loop = 0;
+        S.labels = [];
+        if (block)
+            var a = block_();
+        else
+            var a = expression(false);
+        --S.in_function;
+        S.in_loop = loop;
+        S.labels = labels;
+        return a;
+    }
 
     function if_() {
         var cond = parenthesised(), body = statement(), belse = null;
@@ -15650,13 +16065,25 @@ function parse($TEXT, options) {
 
     function vardefs(no_in, in_const) {
         var a = [];
+        var def;
         for (;;) {
-            a.push(new AST_VarDef({
-                start : S.token,
-                name  : as_symbol(in_const ? AST_SymbolConst : AST_SymbolVar),
-                value : is("operator", "=") ? (next(), expression(false, no_in)) : null,
-                end   : prev()
-            }));
+            var sym_type = in_const ? AST_SymbolConst : AST_SymbolVar;
+            if (is("punc", "{") || is("punc", "[")) {
+                def = new AST_VarDef({
+                    start: S.token,
+                    name: destructuring_(sym_type),
+                    value: is("operator", "=") ? (expect_token("operator", "="), expression(false, no_in)) : null,
+                    end: prev()
+                });
+            } else {
+                def = new AST_VarDef({
+                    start : S.token,
+                    name  : as_symbol(sym_type),
+                    value : is("operator", "=") ? (next(), expression(false, no_in)) : null,
+                    end   : prev()
+                })
+            }
+            a.push(def);
             if (!is("punc", ","))
                 break;
             next();
@@ -15664,8 +16091,58 @@ function parse($TEXT, options) {
         return a;
     };
 
+    var destructuring_ = embed_tokens(function (sym_type) {
+        var is_array = is("punc", "[");
+        var closing = is_array ? ']' : '}';
+        var sym_type = sym_type || AST_SymbolRef;
+
+        next();
+
+        var first = true, children = [];
+        while (!is("punc", closing)) {
+            if (first) first = false; else expect(",");
+            if (is("punc", closing)) break;
+            if (is("punc", ",")) {
+                children.push(new AST_Hole({ start: S.token, end: S.token }));
+            } else if (is("punc", "[") || is("punc", "{")) {
+                children.push(destructuring_(sym_type));
+            } else if (is("expand", "...")) {
+                next();
+                var symbol = _make_symbol(sym_type);
+                children.push(new AST_Expansion({
+                    start: prev(),
+                    symbol: symbol,
+                    end: S.token
+                }));
+                next();
+            } else if (is("name")) {
+                children.push(new (sym_type)({
+                    name  : String(S.token.value),
+                    start : S.token,
+                    default: (next(), is("operator", "=")) ? (next(), expression(false)) : undefined,
+                    end   : S.token
+                }));
+            } else {
+                children.push(expression());
+            }
+        }
+        next()
+        return new AST_Destructuring({
+            names: children,
+            is_array: is_array
+        })
+    });
+
     var var_ = function(no_in) {
         return new AST_Var({
+            start       : prev(),
+            definitions : vardefs(no_in, false),
+            end         : prev()
+        });
+    };
+
+    var let_ = function(no_in) {
+        return new AST_Let({
             start       : prev(),
             definitions : vardefs(no_in, false),
             end         : prev()
@@ -15683,6 +16160,14 @@ function parse($TEXT, options) {
     var new_ = function(allow_calls) {
         var start = S.token;
         expect_token("operator", "new");
+        if (is("punc", ".")) {
+            next();
+            expect_token("name");
+            return subscripts(new AST_NewTarget({
+                start : start,
+                end   : prev()
+            }), allow_calls);
+        }
         var newexp = expr_atom(false), args;
         if (is("punc", "(")) {
             next();
@@ -15745,16 +16230,19 @@ function parse($TEXT, options) {
         if (is("punc")) {
             switch (start.value) {
               case "(":
-                next();
-                var ex = expression(true);
+                var ex = params_or_seq_();
                 ex.start = start;
                 ex.end = S.token;
-                expect(")");
-                return subscripts(ex, allow_calls);
+                if (is("arrow", "=>")) {
+                    return arrow_function(ex);
+                }
+                return subscripts(ex.as_expr(croak), allow_calls);
               case "[":
                 return subscripts(array_(), allow_calls);
               case "{":
-                return subscripts(object_(), allow_calls);
+                return subscripts(object_or_object_destructuring_(), allow_calls);
+              case "`":
+                return subscripts(template_string(), allow_calls);
             }
             unexpected();
         }
@@ -15765,11 +16253,50 @@ function parse($TEXT, options) {
             func.end = prev();
             return subscripts(func, allow_calls);
         }
+        if (is("keyword", "class")) {
+            next();
+            var cls = class_(AST_ClassExpression);
+            cls.start = start;
+            cls.end = prev();
+            return subscripts(cls, allow_calls);
+        }
         if (ATOMIC_START_TOKEN[S.token.type]) {
             return subscripts(as_atom_node(), allow_calls);
         }
         unexpected();
     };
+
+    function template_string() {
+        var tokenizer_S = S.input, start = S.token, segments = [], segment = "", ch;
+
+        while ((ch = tokenizer_S.next()) !== "`")  {
+            if (ch === "$" && tokenizer_S.peek() === "{") {
+                segments.push(segment); segment = "";
+                tokenizer_S.next();
+                next();
+                segments.push(expression());
+                if (!is("punc", "}")) {
+                    // force error message
+                    expect("}");
+                }
+                continue;
+            }
+            segment += ch;
+            if (ch === "\\") {
+                segment += tokenizer_S.next();
+            }
+        }
+
+        segments.push(segment);
+
+        next();
+
+        return new AST_TemplateString({
+            start: start,
+            segments: segments,
+            end: S.token
+        });
+    }
 
     function expr_list(closing, allow_trailing_comma, allow_empty) {
         var first = true, a = [];
@@ -15793,9 +16320,9 @@ function parse($TEXT, options) {
         });
     });
 
-    var object_ = embed_tokens(function() {
+    var object_or_object_destructuring_ = embed_tokens(function() {
+        var start = S.token, first = true, a = [];
         expect("{");
-        var first = true, a = [];
         while (!is("punc", "}")) {
             if (first) first = false; else expect(",");
             if (!options.strict && is("punc", "}"))
@@ -15804,43 +16331,253 @@ function parse($TEXT, options) {
             var start = S.token;
             var type = start.type;
             var name = as_property_name();
-            if (type == "name" && !is("punc", ":")) {
-                if (name == "get") {
-                    a.push(new AST_ObjectGetter({
-                        start : start,
-                        key   : as_atom_node(),
-                        value : function_(AST_Accessor),
-                        end   : prev()
-                    }));
-                    continue;
-                }
-                if (name == "set") {
-                    a.push(new AST_ObjectSetter({
-                        start : start,
-                        key   : as_atom_node(),
-                        value : function_(AST_Accessor),
-                        end   : prev()
-                    }));
+            if (type != "string" && type != "num" && !is("punc", ":")) {
+                var concise = concise_method_or_getset(name, start);
+                if (concise) {
+                    a.push(concise);
                     continue;
                 }
             }
-            expect(":");
-            a.push(new AST_ObjectKeyVal({
-                start : start,
-                quote : start.quote,
-                key   : name,
-                value : expression(false),
-                end   : prev()
-            }));
+
+            if (type == "punc" && start.value == "[") {
+                expect(":");
+                a.push(new AST_ObjectComputedKeyVal({
+                    key: name,
+                    value: expression(false)
+                }));
+                continue;
+            }
+            
+            if (is("operator", "=")) {
+                next();
+                a.push(new AST_Assign({
+                    start: start,
+                    // Symbol class doesn't matter. This is only meant to carry the symbol name into .as_params() since this is not normally valid.
+                    left: new AST_SymbolRef({
+                        start: start,
+                        end: start,
+                        name: name
+                    }),
+                    operator: "=",
+                    right: expression(false),
+                    end: prev()
+                }));
+            } else if (!is("punc", ":")) {
+                // It's one of those object destructurings, the value is its own name
+                a.push(new AST_ObjectKeyVal({
+                    start: start,
+                    end: start,
+                    key: name,
+                    value: new AST_SymbolRef({
+                        start: start,
+                        end: start,
+                        name: name
+                    }),
+                    shorthand: true,
+                }));
+            } else {
+                expect(":");
+                a.push(new AST_ObjectKeyVal({
+                    start : start,
+                    key   : name,
+                    value : expression(false),
+                    end   : prev()
+                }));
+            }
         }
         next();
-        return new AST_Object({ properties: a });
+        return new AST_Object({ properties: a })
     });
+
+    function class_(KindOfClass) {
+        var start, method, class_name, name, extends_, a = [];
+
+        if (S.token.type == "name" && S.token.value != "extends") {
+            class_name = as_symbol(KindOfClass === AST_DefClass ? AST_SymbolDefClass : AST_SymbolClass);
+        }
+
+        if (KindOfClass === AST_DefClass && !class_name) {
+            croak();
+        }
+
+        if (S.token.value == "extends") {
+            next();
+            extends_ = expression(true);
+        }
+
+        expect("{");
+
+        if (is("punc", ";")) { next(); }  // Leading semicolons are okay in class bodies.
+        while (!is("punc", "}")) {
+            start = S.token;
+            name = as_property_name();
+            method = concise_method_or_getset(name, start);
+            if (!method) { croak(); }
+            a.push(method);
+            if (is("punc", ";")) { next(); }
+        }
+
+        next();
+
+        return new KindOfClass({
+            start: start,
+            name: class_name,
+            extends: extends_,
+            properties: a,
+            end: prev(),
+        });
+    }
+
+    function concise_method_or_getset(name, start) {
+        var is_static = false;
+        if (name === "static" && !is("punc", "(")) {
+            is_static = true;
+            name = S.token.value;
+            next();
+        }
+        if (is("punc", "(")) {
+            return new AST_ConciseMethod({
+                start    : start,
+                static   : is_static,
+                name     : new AST_SymbolMethod({ name: name }),
+                argnames : params_or_seq_().as_params(croak),
+                body     : _function_body(true),
+                end      : prev()
+            });
+        }
+        if (name == "get") {
+            return new AST_ObjectGetter({
+                start : start,
+                static: is_static,
+                key   : as_atom_node(),
+                value : function_(AST_Accessor),
+                end   : prev()
+            });
+        }
+        if (name == "set") {
+            return new AST_ObjectSetter({
+                start : start,
+                static: is_static,
+                key   : as_atom_node(),
+                value : function_(AST_Accessor),
+                end   : prev()
+            });
+        }
+    }
+
+    function import_() {
+        var start = prev();
+        var imported_name;
+        var imported_names;
+        if (is("name")) {
+            imported_name = as_symbol(AST_SymbolImport);
+        }
+
+        if (is("punc", ",")) {
+            next();
+        }
+
+        if (is("punc", "{")) {
+            next();
+            imported_names = [];
+            while (!is("punc", "}")) {
+                imported_names.push(import_name());
+                if (is("punc", ",")) {
+                    next();
+                }
+            }
+            next();
+        }
+
+        if (imported_names || imported_name) {
+            expect_token("name", "from");
+        }
+        var mod_str = S.token;
+        if (mod_str.type !== 'string') {
+            unexpected();
+        }
+        next();
+        return new AST_Import({
+            start: start,
+            imported_name: imported_name,
+            imported_names: imported_names,
+            module_name: new AST_String({
+                start: mod_str,
+                value: mod_str.value,
+                quote: mod_str.quote,
+                end: mod_str,
+            }),
+            end: S.token,
+        });
+    }
+
+    function import_name() {
+        var start = S.token;
+        var foreign_name;
+        var name;
+
+        if (peek().value === "as" && peek().type === "name") {
+            foreign_name = as_symbol(AST_SymbolImportForeign);
+            next();  // The "as" word
+        }
+        name = as_symbol(AST_SymbolImport);
+
+        if (foreign_name === undefined) {
+            foreign_name = new AST_SymbolImportForeign({
+                name: name.name,
+                start: name.start,
+                end: name.end,
+            });
+        }
+
+        return new AST_NameImport({
+            start: start,
+            foreign_name: foreign_name,
+            name: name,
+            end: prev(),
+        })
+    }
+
+    function export_() {
+        var start = S.token;
+        var is_default;
+        var exported_value;
+        var exported_definition;
+
+        if (is("keyword", "default")) {
+            is_default = true;
+            next();
+        }
+
+        var is_definition =
+            is("keyword", "var") || is("keyword", "let") || is("keyword", "const") ||
+            is("keyword", "class") || is("keyword", "function");
+
+        if (is_definition) {
+            exported_definition = statement();
+        } else {
+            exported_value = expression();
+        }
+
+        return new AST_Export({
+            start: start,
+            is_default: is_default,
+            exported_value: exported_value,
+            exported_definition: exported_definition,
+            end: prev(),
+        });
+    }
 
     function as_property_name() {
         var tmp = S.token;
         next();
         switch (tmp.type) {
+          case "punc":
+            if (tmp.value === "[") {
+                var ex = expression(false);
+                expect("]");
+                return ex;
+            } else unexpected();
           case "num":
           case "string":
           case "name":
@@ -15869,7 +16606,9 @@ function parse($TEXT, options) {
 
     function _make_symbol(type) {
         var name = S.token.value;
-        return new (name == "this" ? AST_This : type)({
+        return new (name == "this" ? AST_This :
+                    name == "super" ? AST_Super :
+                    type)({
             name  : String(name),
             start : S.token,
             end   : S.token
@@ -15913,12 +16652,31 @@ function parse($TEXT, options) {
             return subscripts(new AST_Call({
                 start      : start,
                 expression : expr,
-                args       : expr_list(")"),
+                args       : call_args(),
                 end        : prev()
             }), true);
         }
         return expr;
     };
+
+    var call_args = embed_tokens(function call_args() {
+        var first = true;
+        var args = [];
+        while (!is("punc", ")")) {
+            if (first) first = false; else expect(",");
+            if (is("expand", "...")) {
+                next();
+                args.push(new AST_Expansion({
+                    start: prev(),
+                    symbol: as_symbol(AST_SymbolFunarg)
+                }));
+            } else {
+                args.push(expression(false));
+            }
+        }
+        next();
+        return args;
+    });
 
     var maybe_unary = function(allow_calls) {
         var start = S.token;
@@ -15989,12 +16747,23 @@ function parse($TEXT, options) {
     function is_assignable(expr) {
         if (!options.strict) return true;
         if (expr instanceof AST_This) return false;
+        if (expr instanceof AST_Super) return false;
         return (expr instanceof AST_PropAccess || expr instanceof AST_Symbol);
     };
 
+    // In ES6, AssignmentExpression can also be an ArrowFunction
     var maybe_assign = function(no_in) {
         var start = S.token;
-        var left = maybe_conditional(no_in), val = S.token.value;
+
+        if (start.type == "punc" && start.value == "(" && peek().value == ")") {
+            next();
+            next();
+            return arrow_function([]);
+        }
+
+        var left = maybe_conditional(no_in);
+        var val = S.token.value;
+
         if (is("operator") && ASSIGNMENT(val)) {
             if (is_assignable(left)) {
                 next();
@@ -16008,12 +16777,35 @@ function parse($TEXT, options) {
             }
             croak("Invalid assignment");
         }
+        if (is("arrow")) {
+            left = new AST_SymbolFunarg({
+                name: left.name,
+                start: left.start,
+                end: left.end,
+            });
+            return arrow_function([left])
+        }
         return left;
     };
 
     var expression = function(commas, no_in) {
         var start = S.token;
         var expr = maybe_assign(no_in);
+        if (expr instanceof AST_SymbolRef && is("arrow", "=>")) {
+            expr = new AST_ArrowParametersOrSeq({
+                start: expr.start,
+                end: expr.end,
+                expressions: [expr]
+            });
+            return arrow_function(expr);
+        }
+        if ((expr instanceof AST_SymbolRef || expr instanceof AST_PropAccess) && is("punc", "`")) {
+            return new AST_PrefixedTemplateString({
+                start: start,
+                prefix: expr,
+                template_string: template_string()
+            })
+        }
         if (commas && is("punc", ",")) {
             next();
             return new AST_Seq({
@@ -16220,10 +17012,18 @@ TreeTransformer.prototype = new TreeWalker;
         if (self.value) self.value = self.value.transform(tw);
     });
 
+    _(AST_Destructuring, function(self, tw) {
+        self.names = do_list(self.names, tw);
+    });
+
     _(AST_Lambda, function(self, tw){
         if (self.name) self.name = self.name.transform(tw);
         self.argnames = do_list(self.argnames, tw);
-        self.body = do_list(self.body, tw);
+        if (self.body instanceof AST_Node) {
+            self.body = self.body.transform(tw);
+        } else {
+            self.body = do_list(self.body, tw);
+        }
     });
 
     _(AST_Call, function(self, tw){
@@ -16325,7 +17125,9 @@ function SymbolDef(scope, index, orig) {
     this.scope = scope;
     this.references = [];
     this.global = false;
+    this.export = false;
     this.mangled_name = null;
+    this.object_destructuring_arg = false;
     this.undeclared = false;
     this.constant = false;
     this.index = index;
@@ -16336,11 +17138,17 @@ SymbolDef.prototype = {
         if (!options) options = {};
 
         return (this.global && !options.toplevel)
+            || this.export
+            || this.object_destructuring_arg
             || this.undeclared
             || (!options.eval && (this.scope.uses_eval || this.scope.uses_with))
             || (options.keep_fnames
                 && (this.orig[0] instanceof AST_SymbolLambda
-                    || this.orig[0] instanceof AST_SymbolDefun));
+                    || this.orig[0] instanceof AST_SymbolDefun))
+            || this.orig[0] instanceof AST_SymbolMethod
+            || (options.keep_classnames
+                && (this.orig[0] instanceof AST_SymbolClass
+                    || this.orig[0] instanceof AST_SymbolDefClass));
     },
     mangle: function(options) {
         var cache = options.cache && options.cache.props;
@@ -16371,6 +17179,8 @@ AST_Toplevel.DEFMETHOD("figure_out_scope", function(options){
     var labels = new Dictionary();
     var defun = null;
     var nesting = 0;
+    var in_destructuring = null;
+    var in_export;
     var tw = new TreeWalker(function(node, descend){
         if (options.screw_ie8 && node instanceof AST_Catch) {
             var save_scope = scope;
@@ -16379,6 +17189,12 @@ AST_Toplevel.DEFMETHOD("figure_out_scope", function(options){
             scope.parent_scope = save_scope;
             descend();
             scope = save_scope;
+            return true;
+        }
+        if (node instanceof AST_Destructuring && node.is_array === false) {
+            in_destructuring = node;  // These don't nest
+            descend();
+            in_destructuring = null;
             return true;
         }
         if (node instanceof AST_Scope) {
@@ -16393,6 +17209,11 @@ AST_Toplevel.DEFMETHOD("figure_out_scope", function(options){
             defun = save_defun;
             labels = save_labels;
             return true;        // don't descend again in TreeWalker
+        }
+        if (node instanceof AST_Export) {
+            in_export = true;
+            descend();
+            in_export = false;
         }
         if (node instanceof AST_LabeledStatement) {
             var l = node.label;
@@ -16412,12 +17233,16 @@ AST_Toplevel.DEFMETHOD("figure_out_scope", function(options){
         if (node instanceof AST_Symbol) {
             node.scope = scope;
         }
+        if (node instanceof AST_SymbolFunarg) {
+            node.object_destructuring_arg = !!in_destructuring;
+            defun.def_variable(node, in_export);
+        }
         if (node instanceof AST_Label) {
             node.thedef = node;
             node.references = [];
         }
         if (node instanceof AST_SymbolLambda) {
-            defun.def_function(node);
+            defun.def_function(node, in_export);
         }
         else if (node instanceof AST_SymbolDefun) {
             // Careful here, the scope where this should be defined is
@@ -16425,12 +17250,24 @@ AST_Toplevel.DEFMETHOD("figure_out_scope", function(options){
             // scope when we encounter the AST_Defun node (which is
             // instanceof AST_Scope) but we get to the symbol a bit
             // later.
-            (node.scope = defun.parent_scope).def_function(node);
+            (node.scope = defun.parent_scope).def_function(node, in_export);
+        }
+        else if (node instanceof AST_SymbolClass) {
+            defun.def_variable(node, in_export);
+        }
+        else if (node instanceof AST_SymbolImport) {
+            scope.def_variable(node, in_export);
+        }
+        else if (node instanceof AST_SymbolDefClass) {
+            // This deals with the name of the class being available
+            // inside the class.
+            (node.scope = defun.parent_scope).def_function(node, in_export);
         }
         else if (node instanceof AST_SymbolVar
                  || node instanceof AST_SymbolConst) {
-            var def = defun.def_variable(node);
+            var def = defun.def_variable(node, in_export);
             def.constant = node instanceof AST_SymbolConst;
+            def.destructuring = in_destructuring;
             def.init = tw.parent().value;
         }
         else if (node instanceof AST_SymbolCatch) {
@@ -16451,6 +17288,7 @@ AST_Toplevel.DEFMETHOD("figure_out_scope", function(options){
 
     // pass 2: find back references and eval
     var func = null;
+    var cls = null;
     var globals = self.globals = new Dictionary();
     var tw = new TreeWalker(function(node, descend){
         if (node instanceof AST_Lambda) {
@@ -16458,6 +17296,13 @@ AST_Toplevel.DEFMETHOD("figure_out_scope", function(options){
             func = node;
             descend();
             func = prev_func;
+            return true;
+        }
+        if (node instanceof AST_Class) {
+            var prev_cls = cls;
+            cls = node;
+            descend();
+            cls = prev_cls;
             return true;
         }
         if (node instanceof AST_LoopControl && node.label) {
@@ -16533,16 +17378,27 @@ AST_Scope.DEFMETHOD("find_variable", function(name){
         || (this.parent_scope && this.parent_scope.find_variable(name));
 });
 
-AST_Scope.DEFMETHOD("def_function", function(symbol){
-    this.functions.set(symbol.name, this.def_variable(symbol));
+AST_Scope.DEFMETHOD("def_function", function(symbol, in_export){
+    this.functions.set(symbol.name, this.def_variable(symbol, in_export));
 });
 
-AST_Scope.DEFMETHOD("def_variable", function(symbol){
+AST_Scope.DEFMETHOD("def_variable", function(symbol, in_export){
     var def;
     if (!this.variables.has(symbol.name)) {
         def = new SymbolDef(this, this.variables.size(), symbol);
         this.variables.set(symbol.name, def);
+        def.object_destructuring_arg = symbol.object_destructuring_arg;
         def.global = !this.parent_scope;
+        if (symbol instanceof AST_SymbolImport) {
+            // Imports are not global
+            def.global = false;
+            // TODO The real fix comes with block scoping being first class in uglifyJS,
+            // enabling import definitions to behave like module-level let declarations
+        }
+        if (!this.parent_scope && in_export) {
+            def.global = false;
+            def.export = true;
+        }
     } else {
         def = this.variables.get(symbol.name);
         def.orig.push(symbol);
@@ -16591,7 +17447,8 @@ AST_Scope.DEFMETHOD("references", function(sym){
 });
 
 AST_Symbol.DEFMETHOD("unmangleable", function(options){
-    return this.definition().unmangleable(options);
+    var def = this.definition();
+    return def && def.unmangleable(options);
 });
 
 // property accessors are not mangleable
@@ -16636,7 +17493,8 @@ AST_Toplevel.DEFMETHOD("_default_mangler_options", function(options){
         sort        : false,
         toplevel    : false,
         screw_ie8   : false,
-        keep_fnames : false
+        keep_fnames : false,
+        keep_classnames : false
     });
 });
 
@@ -16690,7 +17548,10 @@ AST_Toplevel.DEFMETHOD("mangle_names", function(options){
         }
     });
     this.walk(tw);
-    to_mangle.forEach(function(def){ def.mangle(options) });
+    to_mangle.forEach(function(def){
+        if (def.destructuring && !def.destructuring.is_array) return;
+        def.mangle(options);
+    });
 
     if (options.cache) {
         options.cache.cname = this.cname;
@@ -16750,6 +17611,8 @@ AST_Toplevel.DEFMETHOD("compute_char_frequency", function(options){
             base54.consider("new");
         else if (node instanceof AST_This)
             base54.consider("this");
+        else if (node instanceof AST_Super)
+            base54.consider("super");
         else if (node instanceof AST_Try)
             base54.consider("try");
         else if (node instanceof AST_Catch)
@@ -17519,6 +18382,28 @@ function OutputStream(options) {
         output.print_string(self.value, self.quote);
         output.semicolon();
     });
+
+    DEFPRINT(AST_Expansion, function (self, output) {
+        output.print('...');
+        self.symbol.print(output);
+    });
+
+    DEFPRINT(AST_Destructuring, function (self, output) {
+        output.print(self.is_array ? "[" : "{");
+        var first = true;
+        self.names.forEach(function (name) {
+            if (first) first = false; else { output.comma(); output.space(); }
+            name.print(output);
+        })
+        output.print(self.is_array ? "]" : "}");
+        if (self.default) {
+            output.space();
+            output.print('=');
+            output.space();
+            self.default.print(output)
+        }
+    })
+
     DEFPRINT(AST_Debugger, function(self, output){
         output.print("debugger");
         output.semicolon();
@@ -17629,7 +18514,11 @@ function OutputStream(options) {
         output.with_parens(function(){
             self.init.print(output);
             output.space();
-            output.print("in");
+            if (self instanceof AST_ForOf) {
+                output.print("of");
+            } else {
+                output.print("in");
+            }
             output.space();
             self.object.print(output);
         });
@@ -17651,9 +18540,11 @@ function OutputStream(options) {
         var self = this;
         if (!nokeyword) {
             output.print("function");
+            if (self.name) {
+                output.space();
+            }
         }
         if (self.name) {
-            output.space();
             self.name.print(output);
         }
         output.with_parens(function(){
@@ -17667,6 +18558,59 @@ function OutputStream(options) {
     });
     DEFPRINT(AST_Lambda, function(self, output){
         self._do_print(output);
+    });
+
+    DEFPRINT(AST_PrefixedTemplateString, function(self, output) {
+        self.prefix.print(output);
+        self.template_string.print(output);
+    });
+    DEFPRINT(AST_TemplateString, function(self, output) {
+        output.print("`");
+        for (var i = 0; i < self.segments.length; i++) {
+            if (typeof self.segments[i] !== "string") {
+                output.print("${");
+                self.segments[i].print(output);
+                output.print("}");
+            } else {
+                output.print(self.segments[i]);
+            }
+        }
+        output.print("`");
+    });
+
+    AST_Arrow.DEFMETHOD("_do_print", function(output){
+        var self = this;
+        var parent = output.parent();
+        var needs_parens = parent instanceof AST_Binary ||
+            parent instanceof AST_Unary ||
+            parent instanceof AST_Call;
+        if (needs_parens) { output.print("(") }
+        if (self.argnames.length === 1 && self.argnames[0] instanceof AST_Symbol) {
+            self.argnames[0].print(output);
+        } else {
+            output.with_parens(function(){
+                self.argnames.forEach(function(arg, i){
+                    if (i) output.comma();
+                    arg.print(output);
+                });
+            });
+        }
+        output.space();
+        output.print('=>');
+        output.space();
+        if (self.body instanceof AST_Node) {
+            this.body.print(output);
+        } else {
+            print_bracketed(this.body, output);
+        }
+        if (needs_parens) { output.print(")") }
+    });
+    DEFPRINT(AST_ConciseMethod, function(self, output){
+        if (self.static) {
+            output.print("static");
+            output.space();
+        }
+        self._do_print(output, true /* do not print "function" */);
     });
 
     /* -----[ exits ]----- */
@@ -17841,11 +18785,76 @@ function OutputStream(options) {
         if (!avoid_semicolon)
             output.semicolon();
     });
+    DEFPRINT(AST_Let, function(self, output){
+        self._do_print(output, "let");
+    });
     DEFPRINT(AST_Var, function(self, output){
         self._do_print(output, "var");
     });
     DEFPRINT(AST_Const, function(self, output){
         self._do_print(output, "const");
+    });
+    DEFPRINT(AST_Import, function(self, output) {
+        output.print("import");
+        output.space();
+        if (self.imported_name) {
+            self.imported_name.print(output);
+        }
+        if (self.imported_name && self.imported_names) {
+            output.print(",");
+            output.space();
+        }
+        if (self.imported_names) {
+            output.print("{");
+            self.imported_names.forEach(function(name_import, i) {
+                output.space();
+                name_import.print(output);
+                if (i < self.imported_names.length - 1) {
+                    output.print(",");
+                    output.space();
+                }
+            });
+            output.space();
+            output.print("}");
+        }
+        if (self.imported_name || self.imported_names) {
+            output.space();
+            output.print("from")
+            output.space();
+        }
+        self.module_name.print(output);
+        output.semicolon();
+    });
+
+    DEFPRINT(AST_NameImport, function(self, output) {
+        var definition = self.name.definition();
+        var names_are_different =
+            (definition && definition.mangled_name || self.name.name) !==
+            self.foreign_name.name;
+        if (names_are_different) {
+            output.print(self.foreign_name.name);
+            output.space();
+            output.print("as");
+            output.space();
+            self.name.print(output);
+        } else {
+            self.name.print(output);
+        }
+    });
+
+    DEFPRINT(AST_Export, function(self, output) {
+        output.print("export");
+        output.space();
+        if (self.is_default) {
+            output.print("default");
+            output.space();
+        }
+        if (self.exported_value) {
+            self.exported_value.print(output);
+        } else if (self.exported_definition) {
+            self.exported_definition.print(output);
+        }
+        output.semicolon();
     });
 
     function parenthesize_for_noin(node, output, noin) {
@@ -18018,9 +19027,45 @@ function OutputStream(options) {
         });
         else output.print("{}");
     });
+    DEFPRINT(AST_Class, function(self, output){
+        output.print("class");
+        output.space();
+        if (self.name) {
+            self.name.print(output);
+            output.space();
+        }
+        if (self.extends) {
+            output.print("extends");
+            output.space();
+            self.extends.print(output);
+            output.space();
+        }
+        if (self.properties.length > 0) output.with_block(function(){
+            self.properties.forEach(function(prop, i){
+                if (i) {
+                    output.newline();
+                }
+                output.indent();
+                prop.print(output);
+            });
+            output.newline();
+        });
+        else output.print("{}");
+    });
+    DEFPRINT(AST_NewTarget, function(self, output) {
+        output.print("new.target");
+    });
     DEFPRINT(AST_ObjectKeyVal, function(self, output){
         var key = self.key;
         var quote = self.quote;
+        var print_as_shorthand = self.shorthand &&
+            self.value instanceof AST_Symbol &&
+            self.key == self.value.print_to_string();
+
+        if (print_as_shorthand) {
+            output.print_name(key);
+            return;
+        }
         if (output.option("quote_keys")) {
             output.print_string(key + "");
         } else if ((typeof key == "number"
@@ -18037,20 +19082,47 @@ function OutputStream(options) {
         self.value.print(output);
     });
     DEFPRINT(AST_ObjectSetter, function(self, output){
+        if (self.static) {
+            output.print("static");
+            output.space();
+        }
         output.print("set");
         output.space();
         self.key.print(output);
         self.value._do_print(output, true);
     });
     DEFPRINT(AST_ObjectGetter, function(self, output){
+        if (self.static) {
+            output.print("static");
+            output.space();
+        }
         output.print("get");
         output.space();
         self.key.print(output);
         self.value._do_print(output, true);
     });
-    DEFPRINT(AST_Symbol, function(self, output){
-        var def = self.definition();
-        output.print_name(def ? def.mangled_name || def.name : self.name);
+    DEFPRINT(AST_ObjectComputedKeyVal, function(self, output) {
+        output.print("[");
+        self.key.print(output);
+        output.print("]:");
+        output.space();
+        self.value.print(output);
+    });
+    AST_Symbol.DEFMETHOD("_do_print", function(output){
+        var def = this.definition();
+        output.print_name(def ? def.mangled_name || def.name : this.name);
+    });
+    DEFPRINT(AST_Symbol, function (self, output) {
+        self._do_print(output);
+    });
+    DEFPRINT(AST_SymbolDeclaration, function(self, output){
+        self._do_print(output);
+        if (self.default) {
+            output.space();
+            output.print('=');
+            output.space();
+            self.default.print(output)
+        }
     });
     DEFPRINT(AST_Undefined, function(self, output){
         output.print("void 0");
@@ -18064,6 +19136,9 @@ function OutputStream(options) {
     });
     DEFPRINT(AST_This, function(self, output){
         output.print("this");
+    });
+    DEFPRINT(AST_Super, function(self, output){
+        output.print("super");
     });
     DEFPRINT(AST_Constant, function(self, output){
         output.print(self.getValue());
@@ -18497,8 +19572,16 @@ merge(Compressor.prototype, {
                 return /@ngInject/.test(comment.value);
             }
             function make_arguments_names_list(func) {
+                var foundDestructuring = false;
                 return func.argnames.map(function(sym){
+                    if (sym instanceof AST_Destructuring) {
+                        compressor.warn("Function with destructuring arguments marked with @ngInject [{file}:{line},{col}]", token);
+                        foundDestructuring = true;
+                    }
+                    if (foundDestructuring) { return null; }
                     return make_node(AST_String, sym, { value: sym.name });
+                }).filter(function (name) {
+                    return name !== null;
                 });
             }
             function make_array(orig, elements) {
@@ -18992,6 +20075,32 @@ merge(Compressor.prototype, {
                 return [ this ];
             }
         });
+        AST_Node.DEFMETHOD("is_constant", function(compressor){
+            // Accomodate when compress option evaluate=false
+            // as well as the common constant expressions !0 and !1
+            return this instanceof AST_Constant
+                || (this instanceof AST_UnaryPrefix && this.operator == "!"
+                    && this.expression instanceof AST_Constant)
+                || this.evaluate(compressor).length > 1;
+        });
+        // Obtain the constant value of an expression already known to be constant.
+        // Result only valid iff this.is_constant(compressor) is true.
+        AST_Node.DEFMETHOD("constant_value", function(compressor){
+            // Accomodate when option evaluate=false.
+            if (this instanceof AST_Constant) return this.value;
+            // Accomodate the common constant expressions !0 and !1 when option evaluate=false.
+            if (this instanceof AST_UnaryPrefix
+                && this.operator == "!"
+                && this.expression instanceof AST_Constant) {
+                return !this.expression.value;
+            }
+            var result = this.evaluate(compressor)
+            if (result.length > 1) {
+                return result[1];
+            }
+            // should never be reached
+            return undefined;
+        });
         def(AST_Statement, function(){
             throw new Error(string_template("Cannot evaluate a statement [{file}:{line},{col}]", this.start));
         });
@@ -19000,6 +20109,9 @@ merge(Compressor.prototype, {
             // inherits from AST_Statement; however, an AST_Function
             // isn't really a statement.  This could byte in other
             // places too. :-( Wish JS had multiple inheritance.
+            throw def;
+        });
+        def(AST_Arrow, function() {
             throw def;
         });
         function ev(node, compressor) {
@@ -19020,7 +20132,8 @@ merge(Compressor.prototype, {
               case "typeof":
                 // Function would be evaluated to an array and so typeof would
                 // incorrectly return 'object'. Hence making is a special case.
-                if (e instanceof AST_Function) return typeof function(){};
+                if (e instanceof AST_Function ||
+                    e instanceof AST_Arrow) return typeof function(){};
 
                 e = ev(e, compressor);
 
@@ -19211,6 +20324,9 @@ merge(Compressor.prototype, {
             return false;
         });
         def(AST_ObjectProperty, function(compressor){
+            if (this instanceof AST_ObjectComputedKeyVal &&
+                    this.key.has_side_effects(compressor))
+                return true;
             return this.value.has_side_effects(compressor);
         });
         def(AST_Array, function(compressor){
@@ -19250,6 +20366,7 @@ merge(Compressor.prototype, {
             var n = this.body.length;
             return n > 0 && aborts(this.body[n - 1]);
         };
+        def(AST_Import, function(){ return null; });
         def(AST_BlockStatement, block_aborts);
         def(AST_SwitchBranch, block_aborts);
         def(AST_If, function(){
@@ -19283,6 +20400,7 @@ merge(Compressor.prototype, {
     });
 
     OPT(AST_Block, function(self, compressor){
+        if (self.body instanceof AST_Node) { return self; }
         self.body = tighten_body(self.body, compressor);
         return self;
     });
@@ -19316,6 +20434,7 @@ merge(Compressor.prototype, {
                     }
                     if (node instanceof AST_Definitions && scope === self) {
                         node.definitions.forEach(function(def){
+                            if (def.is_destructuring()) return;  /* Destructurings are type assertions! */
                             if (def.value) {
                                 initializations.add(def.name.name, def.value);
                                 if (def.value.has_side_effects(compressor)) {
@@ -19362,17 +20481,29 @@ merge(Compressor.prototype, {
                     if (node instanceof AST_Lambda && !(node instanceof AST_Accessor)) {
                         if (!compressor.option("keep_fargs")) {
                             for (var a = node.argnames, i = a.length; --i >= 0;) {
-                                var sym = a[i];
-                                if (sym.unreferenced()) {
-                                    a.pop();
-                                    compressor.warn("Dropping unused function argument {name} [{file}:{line},{col}]", {
-                                        name : sym.name,
-                                        file : sym.start.file,
-                                        line : sym.start.line,
-                                        col  : sym.start.col
-                                    });
+                                if (a[i] instanceof AST_Destructuring) {
+                                    // Do not drop destructuring arguments.
+                                    // They constitute a type assertion, so dropping
+                                    // them would stop that TypeError which would happen
+                                    // if someone called it with an incorrectly formatted
+                                    // parameter.
+                                    break;
+                                } else {
+                                    var sym = a[i];
+                                    if (sym instanceof AST_Expansion) {
+                                        sym = sym.symbol;
+                                    }
+                                    if (sym.unreferenced()) {
+                                        a.pop();
+                                        compressor.warn("Dropping unused function argument {name} [{file}:{line},{col}]", {
+                                            name : sym.name,
+                                            file : sym.start.file,
+                                            line : sym.start.line,
+                                            col  : sym.start.col
+                                        });
+                                    }
+                                    else break;
                                 }
-                                else break;
                             }
                         }
                     }
@@ -19390,6 +20521,7 @@ merge(Compressor.prototype, {
                     }
                     if (node instanceof AST_Definitions && !(tt.parent() instanceof AST_ForIn)) {
                         var def = node.definitions.filter(function(def){
+                            if (def.is_destructuring()) return true;
                             if (member(def.name.definition(), in_use)) return true;
                             var w = {
                                 name : def.name.name,
@@ -19480,8 +20612,12 @@ merge(Compressor.prototype, {
     AST_Scope.DEFMETHOD("hoist_declarations", function(compressor){
         var self = this;
         if (compressor.has_directive("use asm")) return self;
+        // Hoisting makes no sense in an arrow func
+        if (!Array.isArray(self.body)) return self;
+
         var hoist_funs = compressor.option("hoist_funs");
         var hoist_vars = compressor.option("hoist_vars");
+
         if (hoist_funs || hoist_vars) {
             var dirs = [];
             var hoisted = [];
@@ -19510,6 +20646,7 @@ merge(Compressor.prototype, {
                         }
                         if (node instanceof AST_Var && hoist_vars) {
                             node.definitions.forEach(function(def){
+                                if (def.is_destructuring()) { return; }
                                 vars.set(def.name.name, def);
                                 ++vars_found;
                             });
@@ -19539,7 +20676,7 @@ merge(Compressor.prototype, {
                 vars.each(function(def, name){
                     if (self instanceof AST_Lambda
                         && find_if(function(x){ return x.name == def.name.name },
-                                   self.argnames)) {
+                                   self.args_as_names())) {
                         vars.del(name);
                     } else {
                         def = def.clone();
@@ -19950,13 +21087,23 @@ merge(Compressor.prototype, {
 
     AST_Definitions.DEFMETHOD("to_assignments", function(){
         var assignments = this.definitions.reduce(function(a, def){
-            if (def.value) {
+            if (def.value && !def.is_destructuring()) {
                 var name = make_node(AST_SymbolRef, def.name, def.name);
                 a.push(make_node(AST_Assign, def, {
                     operator : "=",
                     left     : name,
                     right    : def.value
                 }));
+            } else if (def.value) {
+                // Because it's a destructuring, do not turn into an assignment.
+                var varDef = make_node(AST_VarDef, def, {
+                    name: def.name,
+                    value: def.value
+                });
+                var var_ = make_node(AST_Var, def, {
+                    definitions: [ varDef ]
+                });
+                a.push(var_);
             }
             return a;
         }, []);
@@ -19967,6 +21114,10 @@ merge(Compressor.prototype, {
     OPT(AST_Definitions, function(self, compressor){
         if (self.definitions.length == 0)
             return make_node(AST_EmptyStatement, self);
+        return self;
+    });
+
+    OPT(AST_Import, function(self, compressor) {
         return self;
     });
 
@@ -20082,6 +21233,11 @@ merge(Compressor.prototype, {
                             }
                         }
                     }
+                    break;
+                  case "Symbol":
+                    // Symbol's argument is only used for debugging.
+                    self.args = [];
+                    return self;
                     break;
                 }
             }
@@ -20693,32 +21849,48 @@ merge(Compressor.prototype, {
                 alternative: alternative
             });
         }
-        // x=y?1:1 --> x=1
-        if (consequent instanceof AST_Constant
-            && alternative instanceof AST_Constant
+        // y?1:1 --> 1
+        if (consequent.is_constant(compressor)
+            && alternative.is_constant(compressor)
             && consequent.equivalent_to(alternative)) {
+            var consequent_value = consequent.constant_value();
             if (self.condition.has_side_effects(compressor)) {
-                return AST_Seq.from_array([self.condition, make_node_from_constant(compressor, consequent.value, self)]);
+                return AST_Seq.from_array([self.condition, make_node_from_constant(compressor, consequent_value, self)]);
             } else {
-                return make_node_from_constant(compressor, consequent.value, self);
-
+                return make_node_from_constant(compressor, consequent_value, self);
             }
         }
-        // x=y?true:false --> x=!!y
-        if (consequent instanceof AST_True
-            && alternative instanceof AST_False) {
+
+        // y?true:false --> !!y
+        if (is_true(consequent) && is_false(alternative)) {
             self.condition = self.condition.negate(compressor);
             return make_node(AST_UnaryPrefix, self.condition, {
                 operator: "!",
                 expression: self.condition
             });
         }
-        // x=y?false:true --> x=!y
-        if (consequent instanceof AST_False
-            && alternative instanceof AST_True) {
+        // y?false:true --> !y
+        if (is_false(consequent) && is_true(alternative)) {
             return self.condition.negate(compressor)
         }
         return self;
+
+        // AST_True or !0
+        function is_true(node) {
+            return node instanceof AST_True
+                || (node instanceof AST_UnaryPrefix
+                    && node.operator == "!"
+                    && node.expression instanceof AST_Constant
+                    && !node.expression.value);
+        }
+        // AST_False or !1
+        function is_false(node) {
+            return node instanceof AST_False
+                || (node instanceof AST_UnaryPrefix
+                    && node.operator == "!"
+                    && node.expression instanceof AST_Constant
+                    && !!node.expression.value);
+        }
     });
 
     OPT(AST_Boolean, function(self, compressor){
@@ -21536,6 +22708,9 @@ function mangle_properties(ast, options) {
                 addStrings(node.property);
             }
         }
+        else if (node instanceof AST_ConciseMethod) {
+            add(node.name.name);
+        }
     }));
 
     // step 2: transform the tree, renaming properties
@@ -21552,6 +22727,11 @@ function mangle_properties(ast, options) {
         }
         else if (node instanceof AST_Sub) {
             node.property = mangleStrings(node.property);
+        }
+        else if (node instanceof AST_ConciseMethod) {
+            if (should_mangle(node.name.name)) {
+                node.name.name = mangle(node.name.name);
+            }
         }
         // else if (node instanceof AST_String) {
         //     if (should_mangle(node.value)) {
@@ -21654,7 +22834,7 @@ function mangle_properties(ast, options) {
 
 }
 
-AST_Node.warn_function = function(txt) { logger.error("uglifyjs2 WARN: " + txt); };
+AST_Node.warn_function = function(txt) { logger.error("uglifyjs WARN: " + txt); };
 exports.minify = function(files, options, name) {
     options = defaults(options, {
         spidermonkey : false,
@@ -21799,6 +22979,67 @@ exports.describe_ast = function() {
     doitem(AST_Node);
     return out + "";
 };
+
+function readReservedFile(filename, reserved) {
+    if (!reserved) {
+        reserved = { vars: [], props: [] };
+    }
+    var data = rjsFile.readFile(filename, "utf8");
+    data = JSON.parse(data);
+    if (data.vars) {
+        data.vars.forEach(function(name){
+            push_uniq(reserved.vars, name);
+        });
+    }
+    if (data.props) {
+        data.props.forEach(function(name){
+            push_uniq(reserved.props, name);
+        });
+    }
+    return reserved;
+}
+
+exports.readReservedFile = readReservedFile;
+
+exports.readDefaultReservedFile = function(reserved) {
+    return readReservedFile(path.join(__dirname, "domprops.json"), reserved);
+};
+
+exports.readNameCache = function(filename, key) {
+    var cache = null;
+    if (filename) {
+        try {
+            var cache = rjsFile.readFile(filename, "utf8");
+            cache = JSON.parse(cache)[key];
+            if (!cache) throw "init";
+            cache.props = Dictionary.fromObject(cache.props);
+        } catch(ex) {
+            cache = {
+                cname: -1,
+                props: new Dictionary()
+            };
+        }
+    }
+    return cache;
+};
+
+exports.writeNameCache = function(filename, key, cache) {
+    if (filename) {
+        var data;
+        try {
+            data = rjsFile.readFile(filename, "utf8");
+            data = JSON.parse(data);
+        } catch(ex) {
+            data = {};
+        }
+        data[key] = {
+            cname: cache.cname,
+            props: cache.props.toObject()
+        };
+        fs.writeFileSync(filename, JSON.stringify(data, null, 2), "utf8");
+    }
+};
+
 
 });
 /*jslint plusplus: true */
